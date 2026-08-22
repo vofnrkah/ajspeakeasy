@@ -1,0 +1,2 @@
+aiohubspace==1.2.0
+gpiozero>=2.0,<3
