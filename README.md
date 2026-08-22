@@ -3,7 +3,7 @@
 Raspberry Pi door controller that responds to either a physical GPIO button or
 a software-generated button press. A trigger flashes the yellow status LED,
 plays the jukebox song, and turns a Hubspace-controlled Defiant smart plug on
-for 20 seconds.
+for 26 seconds.
 
 The application runs continuously as a `systemd` service and writes structured,
 rotating logs to disk. Physical and software button presses use the same code
@@ -11,8 +11,8 @@ path, so the complete system can be tested without the button connected.
 
 ## Current release
 
-- Version: `v0.4.0`
-- Release: `Hubspace Light Release`
+- Version: `v0.4.1`
+- Release: `26-Second Light Timer Release`
 - Tested smart plug: Defiant HPPA11CWB
 - Tested Raspberry Pi: Raspberry Pi 3 Model B+
 - Tested Python: Python 3.13
@@ -25,7 +25,7 @@ Each accepted button press performs these operations concurrently:
 2. Play `/home/admin/Desktop/door/jukebox.mp3`.
 3. Authenticate to Hubspace using the saved refresh token.
 4. Turn on the configured smart plug.
-5. Wait 20 seconds.
+5. Wait 26 seconds.
 6. Attempt to turn off the smart plug, including when another Hubspace error
    occurs during the light cycle.
 
@@ -191,7 +191,7 @@ sudo systemctl kill --kill-whom=main --signal=SIGUSR1 door-controller
 
 This executes the same `button_pressed()` function used by the GPIO button. It
 should flash the yellow LED, start one audio stream, turn the configured plug
-on, and turn it off after 20 seconds.
+on, and turn it off after 26 seconds.
 
 Follow the log during the test:
 
@@ -205,7 +205,7 @@ Successful events include:
 TEST BUTTON SIGNAL RECEIVED
 BUTTON PRESSED
 Starting playback on Bluetooth default
-HUBSPACE LIGHT ON for 20 seconds
+HUBSPACE LIGHT ON for 26 seconds
 HUBSPACE LIGHT OFF
 Playback finished successfully on Bluetooth default
 Ready for next button press
