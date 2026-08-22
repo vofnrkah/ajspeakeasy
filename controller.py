@@ -32,8 +32,8 @@ log = logging.getLogger("door-controller")
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.2.1"
-RELEASE = "Bluetooth Default Audio Release"
+VERSION = "v0.2.2"
+RELEASE = "Automatic Audio Output Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
@@ -218,79 +218,43 @@ def play_audio():
         ensure_max_volume()
         log.info("Playing audio file: %s", MP3_FILE)
 
-        output_commands = [
-            (
-                "analog headphones",
-                [
-                    "/usr/bin/mpg123",
-                    "-q",
-                    "-a",
-                    ANALOG_AUDIO_DEVICE,
-                    MP3_FILE,
-                ],
-            )
-        ]
-
-        # When Bluetooth is the PipeWire default, start a second mpg123
-        # process without an ALSA hardware override. Both processes start
-        # back-to-back and play the same file through both outputs.
+        # Use exactly one output. When Bluetooth is the PipeWire default,
+        # mpg123 follows that default. Otherwise, force the analog ALSA device.
         if default_sink_is_bluetooth():
-            output_commands.append(
-                (
-                    "Bluetooth default",
-                    [
-                        "/usr/bin/mpg123",
-                        "-q",
-                        MP3_FILE,
-                    ],
-                )
-            )
+            output_name = "Bluetooth default"
+            command = [
+                "/usr/bin/mpg123",
+                "-q",
+                MP3_FILE,
+            ]
         else:
-            log.warning(
-                "Bluetooth is not the default sink; playing analog output only"
-            )
+            output_name = "analog headphones"
+            command = [
+                "/usr/bin/mpg123",
+                "-q",
+                "-o",
+                "alsa",
+                "-a",
+                ANALOG_AUDIO_DEVICE,
+                MP3_FILE,
+            ]
 
-        processes = []
+        log.info("Starting playback on %s", output_name)
 
-        for output_name, command in output_commands:
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                processes.append((output_name, process))
-                log.info("Started playback on %s", output_name)
-            except Exception:
-                log.exception("Could not start playback on %s", output_name)
-
-        successful_outputs = []
-
-        for output_name, process in processes:
-            stdout, stderr = process.communicate()
-
-            if process.returncode == 0:
-                successful_outputs.append(output_name)
-                log.info("Playback finished on %s", output_name)
-            else:
-                log.error(
-                    "Playback failed on %s; exit code=%s, stderr=%s",
-                    output_name,
-                    process.returncode,
-                    (stderr or "").strip(),
-                )
-
-            if stdout.strip():
-                log.debug("mpg123 %s output: %s", output_name, stdout.strip())
-
-        if not successful_outputs:
-            raise RuntimeError("Playback failed on every configured output")
-
-        log.info(
-            "Playback finished successfully on: %s",
-            ", ".join(successful_outputs),
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
         )
+
+        if result.stdout.strip():
+            log.debug("mpg123 output: %s", result.stdout.strip())
+
+        if result.stderr.strip():
+            log.warning("mpg123 output: %s", result.stderr.strip())
+
+        log.info("Playback finished successfully on %s", output_name)
 
     except FileNotFoundError:
         log.exception(
