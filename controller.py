@@ -61,8 +61,8 @@ logging.getLogger("aiohubspace").setLevel(logging.WARNING)
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.4.0"
-RELEASE = "Hubspace Light Release"
+VERSION = "v0.4.1"
+RELEASE = "26-Second Light Timer Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
@@ -100,7 +100,7 @@ playback_lock = threading.Lock()
 # ============================================================
 
 HUBSPACE_CONFIG_FILE = Path.home() / ".config" / "ajspeakeasy" / "hubspace.json"
-LIGHT_ON_SECONDS = 20
+LIGHT_ON_SECONDS = 26
 
 
 def load_hubspace_config():
