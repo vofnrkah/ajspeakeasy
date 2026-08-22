@@ -4,6 +4,8 @@ from gpiozero import LED, Button
 from signal import pause
 from time import sleep
 
+import asyncio
+import json
 import logging
 import os
 import signal
@@ -12,6 +14,8 @@ import sys
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from aiohubspace import v1
 
 
 # ============================================================
@@ -34,6 +38,7 @@ file_handler = RotatingFileHandler(
     backupCount=LOG_BACKUP_COUNT,
     encoding="utf-8",
 )
+os.chmod(LOG_FILE, 0o600)
 file_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s %(threadName)s: %(message)s")
 )
@@ -52,8 +57,8 @@ log = logging.getLogger("door-controller")
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.3.0"
-RELEASE = "Rotating File Logging Release"
+VERSION = "v0.4.0"
+RELEASE = "Hubspace Light Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
@@ -84,6 +89,89 @@ os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 playing = False
 playback_lock = threading.Lock()
+
+
+# ============================================================
+# HUBSPACE LIGHT CONFIGURATION
+# ============================================================
+
+HUBSPACE_CONFIG_FILE = Path.home() / ".config" / "ajspeakeasy" / "hubspace.json"
+LIGHT_ON_SECONDS = 20
+
+
+def load_hubspace_config():
+    if not HUBSPACE_CONFIG_FILE.exists():
+        log.warning(
+            "Hubspace light is not configured; run hubspace_setup.py"
+        )
+        return None
+
+    try:
+        with HUBSPACE_CONFIG_FILE.open("r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+
+        required = {"username", "refresh_token", "device_id"}
+        missing = sorted(required.difference(config))
+        if missing:
+            raise ValueError(f"missing configuration keys: {', '.join(missing)}")
+
+        return config
+
+    except Exception:
+        log.exception("Could not load Hubspace configuration")
+        return None
+
+
+async def hubspace_light_cycle_async(config):
+    bridge = None
+    device_id = config["device_id"]
+    instance = config.get("instance")
+
+    try:
+        bridge = v1.HubspaceBridgeV1(
+            config["username"],
+            "",
+            refresh_token=config["refresh_token"],
+            polling_interval=30,
+        )
+
+        # aiohubspace adds a console handler by default. Remove it so library
+        # messages follow this application's rotating file-only logging.
+        for logger_name, logger_object in logging.root.manager.loggerDict.items():
+            if logger_name.startswith("aiohubspace") and isinstance(
+                logger_object, logging.Logger
+            ):
+                logger_object.handlers.clear()
+                logger_object.propagate = True
+
+        await bridge.initialize()
+        await bridge.switches.turn_on(device_id, instance=instance)
+        log.info("HUBSPACE LIGHT ON for %s seconds", LIGHT_ON_SECONDS)
+        await asyncio.sleep(LIGHT_ON_SECONDS)
+
+    except Exception:
+        log.exception("Hubspace light cycle failed")
+
+    finally:
+        if bridge is not None:
+            try:
+                await bridge.switches.turn_off(device_id, instance=instance)
+                log.info("HUBSPACE LIGHT OFF")
+            except Exception:
+                log.exception("Could not turn Hubspace light off")
+
+            try:
+                await bridge.close()
+            except Exception:
+                log.exception("Could not close Hubspace connection")
+
+
+def hubspace_light_cycle():
+    config = load_hubspace_config()
+    if config is None:
+        return
+
+    asyncio.run(hubspace_light_cycle_async(config))
 
 
 # ============================================================
@@ -326,6 +414,13 @@ def button_pressed():
         threading.Thread(
             target=play_audio,
             name="audio-playback",
+            daemon=True,
+        ).start()
+
+        # Light control runs independently so cloud latency cannot delay audio.
+        threading.Thread(
+            target=hubspace_light_cycle,
+            name="hubspace-light",
             daemon=True,
         ).start()
 
