@@ -10,18 +10,38 @@ import signal
 import subprocess
 import sys
 import threading
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-# systemd captures stdout and stores it in the journal. Each message includes
-# a timestamp, severity, and thread name to make diagnosis easier.
+# Keep application logs out of journald and rotate them before the complete
+# set can exceed 100 MB. The active file plus eight backups can use at most
+# 90,000,000 bytes total.
+LOG_DIRECTORY = Path("/home/admin/Desktop/door/logs")
+LOG_FILE = LOG_DIRECTORY / "door-controller.log"
+MAX_LOG_BYTES = 10_000_000
+LOG_BACKUP_COUNT = 8
+
+LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=MAX_LOG_BYTES,
+    backupCount=LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(threadName)s: %(message)s")
+)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(threadName)s: %(message)s",
-    stream=sys.stdout,
+    handlers=[file_handler],
+    force=True,
 )
 
 log = logging.getLogger("door-controller")
@@ -32,8 +52,8 @@ log = logging.getLogger("door-controller")
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.2.2"
-RELEASE = "Automatic Audio Output Release"
+VERSION = "v0.3.0"
+RELEASE = "Rotating File Logging Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
