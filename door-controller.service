@@ -1,0 +1,17 @@
+[Unit]
+Description=Speakeasy Door Controller
+Wants=network-online.target
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/Desktop/door
+ExecStart=/home/admin/Desktop/door/.venv/bin/python3 /home/admin/Desktop/door/controller.py
+Restart=always
+RestartSec=3
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
