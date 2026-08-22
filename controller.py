@@ -1,18 +1,41 @@
+#!/usr/bin/env python3
+
 from gpiozero import LED, Button
 from signal import pause
 from time import sleep
-import subprocess
-import threading
+
+import logging
 import re
+import signal
+import subprocess
+import sys
+import threading
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+# systemd captures stdout and stores it in the journal. Each message includes
+# a timestamp, severity, and thread name to make diagnosis easier.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(threadName)s: %(message)s",
+    stream=sys.stdout,
+)
+
+log = logging.getLogger("door-controller")
+
 
 # ============================================================
 # RELEASE INFO
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.1.0"
-RELEASE = "Prototype Release"
+VERSION = "v0.2.0"
+RELEASE = "Logging and Software Test Release"
 CREATED_BY = "Y00$ung g00s3"
+
 
 # ============================================================
 # GPIO CONFIGURATION
@@ -22,14 +45,10 @@ GREEN_GPIO = 17
 YELLOW_GPIO = 22
 BUTTON_GPIO = 27
 
-green_led = LED(GREEN_GPIO)
-yellow_led = LED(YELLOW_GPIO)
+green_led = None
+yellow_led = None
+button = None
 
-button = Button(
-    BUTTON_GPIO,
-    pull_up=True,
-    bounce_time=0.1
-)
 
 # ============================================================
 # AUDIO CONFIGURATION
@@ -37,7 +56,7 @@ button = Button(
 
 MP3_FILE = "/home/admin/Desktop/door/jukebox.mp3"
 
-# Named device prevents card-number changes after reboot
+# Named device prevents card-number changes after reboot.
 AUDIO_DEVICE = "hw:Headphones,0"
 
 playing = False
@@ -49,12 +68,12 @@ playback_lock = threading.Lock()
 # ============================================================
 
 def show_release_info():
-    print("=" * 52, flush=True)
-    print(f"{APP_NAME}", flush=True)
-    print(f"Version:    {VERSION}", flush=True)
-    print(f"Release:    {RELEASE}", flush=True)
-    print(f"Created by: {CREATED_BY}", flush=True)
-    print("=" * 52, flush=True)
+    log.info("=" * 52)
+    log.info(APP_NAME)
+    log.info("Version: %s", VERSION)
+    log.info("Release: %s", RELEASE)
+    log.info("Created by: %s", CREATED_BY)
+    log.info("=" * 52)
 
 
 # ============================================================
@@ -63,25 +82,32 @@ def show_release_info():
 
 def set_max_volume():
     try:
-        subprocess.run(
+        result = subprocess.run(
             [
                 "/usr/bin/amixer",
                 "sset",
                 "PCM",
-                "100%"
+                "100%",
             ],
+            capture_output=True,
+            text=True,
             check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
         )
 
-        print("PCM volume set to 100%", flush=True)
+        log.info("PCM volume set to 100%%")
 
-    except Exception as error:
-        print(
-            f"VOLUME ERROR: {error}",
-            flush=True
+        if result.stdout.strip():
+            log.debug("amixer output: %s", result.stdout.strip())
+
+    except subprocess.CalledProcessError as error:
+        log.error(
+            "Failed to set PCM volume; exit code=%s, stderr=%s",
+            error.returncode,
+            (error.stderr or "").strip(),
         )
+
+    except Exception:
+        log.exception("Unexpected error while setting PCM volume")
 
 
 def ensure_max_volume():
@@ -90,56 +116,46 @@ def ensure_max_volume():
             [
                 "/usr/bin/amixer",
                 "get",
-                "PCM"
+                "PCM",
             ],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
 
         percentages = re.findall(
             r"\[(\d+)%\]",
-            result.stdout
+            result.stdout,
         )
 
         if not percentages:
-            print(
-                "Could not determine PCM volume - setting to 100%",
-                flush=True
+            log.warning(
+                "Could not determine PCM volume; attempting to set it to 100%%"
             )
-
             set_max_volume()
             return
 
         volumes = [int(value) for value in percentages]
-
-        print(
-            f"Current PCM volume: {volumes}%",
-            flush=True
-        )
+        log.info("Current PCM volume levels: %s", volumes)
 
         if any(volume < 100 for volume in volumes):
-
-            print(
-                "Volume below maximum - setting to 100%",
-                flush=True
+            log.warning(
+                "Volume is below maximum; attempting to set it to 100%%"
             )
-
             set_max_volume()
-
         else:
-            print(
-                "Volume already at 100%",
-                flush=True
-            )
+            log.info("Volume is already at 100%%")
 
-    except Exception as error:
-
-        print(
-            f"Could not check volume: {error}",
-            flush=True
+    except subprocess.CalledProcessError as error:
+        log.error(
+            "Failed to check PCM volume; exit code=%s, stderr=%s",
+            error.returncode,
+            (error.stderr or "").strip(),
         )
+        set_max_volume()
 
+    except Exception:
+        log.exception("Unexpected error while checking PCM volume")
         set_max_volume()
 
 
@@ -148,21 +164,22 @@ def ensure_max_volume():
 # ============================================================
 
 def yellow_flash():
-    yellow_led.on()
+    try:
+        yellow_led.on()
+        log.info("YELLOW LED ON")
 
-    print(
-        "YELLOW LED ON",
-        flush=True
-    )
+        sleep(0.25)
 
-    sleep(0.25)
+    except Exception:
+        log.exception("Error while flashing yellow LED")
 
-    yellow_led.off()
-
-    print(
-        "YELLOW LED OFF",
-        flush=True
-    )
+    finally:
+        try:
+            if yellow_led is not None:
+                yellow_led.off()
+                log.info("YELLOW LED OFF")
+        except Exception:
+            log.exception("Could not turn yellow LED off")
 
 
 # ============================================================
@@ -174,44 +191,47 @@ def play_audio():
 
     try:
         ensure_max_volume()
+        log.info("Playing audio file: %s", MP3_FILE)
 
-        print(
-            f"Playing: {MP3_FILE}",
-            flush=True
-        )
-
-        subprocess.run(
+        result = subprocess.run(
             [
                 "/usr/bin/mpg123",
                 "-q",
                 "-a",
                 AUDIO_DEVICE,
-                MP3_FILE
+                MP3_FILE,
             ],
-            check=True
+            capture_output=True,
+            text=True,
+            check=True,
         )
 
-        print(
-            "Playback finished",
-            flush=True
+        if result.stderr.strip():
+            log.warning("mpg123 output: %s", result.stderr.strip())
+
+        log.info("Playback finished successfully")
+
+    except FileNotFoundError:
+        log.exception(
+            "Audio command or MP3 file was not found; file=%s",
+            MP3_FILE,
         )
 
-    except Exception as error:
-
-        print(
-            f"PLAYBACK ERROR: {error}",
-            flush=True
+    except subprocess.CalledProcessError as error:
+        log.error(
+            "Audio playback failed; exit code=%s, stderr=%s",
+            error.returncode,
+            (error.stderr or "").strip(),
         )
+
+    except Exception:
+        log.exception("Unexpected audio playback error")
 
     finally:
-
         with playback_lock:
             playing = False
 
-        print(
-            "Ready for next button press",
-            flush=True
-        )
+        log.info("Ready for next button press")
 
 
 # ============================================================
@@ -221,64 +241,138 @@ def play_audio():
 def button_pressed():
     global playing
 
-    print(
-        "BUTTON PRESSED",
-        flush=True
-    )
+    try:
+        log.info("BUTTON PRESSED")
 
-    # Flash yellow on EVERY button press
-    threading.Thread(
-        target=yellow_flash,
-        daemon=True
-    ).start()
+        # Flash yellow on every physical or simulated button press.
+        threading.Thread(
+            target=yellow_flash,
+            name="yellow-flash",
+            daemon=True,
+        ).start()
 
-    with playback_lock:
+        with playback_lock:
+            if playing:
+                log.warning("BUTTON ACKNOWLEDGED - song is already playing")
+                return
 
-        if playing:
+            playing = True
 
-            print(
-                "BUTTON ACKNOWLEDGED - song already playing",
-                flush=True
-            )
+        threading.Thread(
+            target=play_audio,
+            name="audio-playback",
+            daemon=True,
+        ).start()
 
-            return
+    except Exception:
+        log.exception("Unhandled error in button handler")
 
-        playing = True
+        with playback_lock:
+            playing = False
 
-    threading.Thread(
-        target=play_audio,
-        daemon=True
-    ).start()
+
+# ============================================================
+# SIGNAL HANDLERS
+# ============================================================
+
+def simulated_button_pressed(signum, frame):
+    """Handle SIGUSR1 by simulating the GPIO button callback."""
+    log.info("TEST BUTTON SIGNAL RECEIVED")
+    button_pressed()
+
+
+def shutdown_requested(signum, frame):
+    signal_name = signal.Signals(signum).name
+    log.info("Shutdown requested by %s", signal_name)
+    raise SystemExit(0)
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+def cleanup():
+    log.info("Cleaning up GPIO resources")
+
+    try:
+        if button is not None:
+            button.close()
+    except Exception:
+        log.exception("Error while closing button input")
+
+    try:
+        if yellow_led is not None:
+            yellow_led.off()
+            yellow_led.close()
+    except Exception:
+        log.exception("Error while closing yellow LED")
+
+    try:
+        if green_led is not None:
+            green_led.off()
+            green_led.close()
+    except Exception:
+        log.exception("Error while closing green LED")
+
+    log.info("Door controller stopped")
 
 
 # ============================================================
 # STARTUP
 # ============================================================
 
-show_release_info()
+def main():
+    global green_led
+    global yellow_led
+    global button
 
-print(
-    "Door controller starting...",
-    flush=True
-)
+    show_release_info()
+    log.info("Door controller starting")
 
-green_led.off()
-yellow_led.off()
+    try:
+        green_led = LED(GREEN_GPIO)
+        yellow_led = LED(YELLOW_GPIO)
 
-ensure_max_volume()
+        button = Button(
+            BUTTON_GPIO,
+            pull_up=True,
+            bounce_time=0.1,
+        )
 
-green_led.on()
+        green_led.off()
+        yellow_led.off()
 
-print(
-    "GREEN LED ON - Controller running",
-    flush=True
-)
+        ensure_max_volume()
 
-button.when_pressed = button_pressed
+        green_led.on()
+        log.info("GREEN LED ON - controller running")
 
-print(
-    "Waiting for button...",
-    flush=True
-)
+        button.when_pressed = button_pressed
+        log.info("Waiting for button on BCM GPIO %s", BUTTON_GPIO)
 
-pause()
+        # SIGUSR1 triggers the same code path as a physical button press.
+        signal.signal(signal.SIGUSR1, simulated_button_pressed)
+
+        # Allow systemd and Ctrl+C to stop the program cleanly.
+        signal.signal(signal.SIGTERM, shutdown_requested)
+        signal.signal(signal.SIGINT, shutdown_requested)
+
+        # pause() returns after a handled signal, so keep waiting in a loop.
+        while True:
+            pause()
+
+    except SystemExit:
+        raise
+
+    except Exception:
+        log.exception("Fatal controller error")
+        return 1
+
+    finally:
+        cleanup()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
