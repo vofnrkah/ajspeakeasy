@@ -5,7 +5,7 @@ from signal import pause
 from time import sleep
 
 import logging
-import re
+import os
 import signal
 import subprocess
 import sys
@@ -32,8 +32,8 @@ log = logging.getLogger("door-controller")
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.2.0"
-RELEASE = "Logging and Software Test Release"
+VERSION = "v0.2.1"
+RELEASE = "Bluetooth Default Audio Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
@@ -55,9 +55,12 @@ button = None
 # ============================================================
 
 MP3_FILE = "/home/admin/Desktop/door/jukebox.mp3"
+ANALOG_AUDIO_DEVICE = "hw:Headphones,0"
 
-# Named device prevents card-number changes after reboot.
-AUDIO_DEVICE = "hw:Headphones,0"
+# A system service does not automatically inherit the user's PipeWire runtime
+# path. Setting it here lets mpg123 and wpctl reach admin's default audio sink,
+# including a connected Bluetooth speaker.
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 playing = False
 playback_lock = threading.Lock()
@@ -81,82 +84,104 @@ def show_release_info():
 # ============================================================
 
 def set_max_volume():
+    # Prefer PipeWire so volume is applied to the current default output,
+    # including Bluetooth. Fall back to ALSA for an analog-only setup.
     try:
-        result = subprocess.run(
+        subprocess.run(
+            [
+                "/usr/bin/wpctl",
+                "set-mute",
+                "@DEFAULT_AUDIO_SINK@",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        subprocess.run(
+            [
+                "/usr/bin/wpctl",
+                "set-volume",
+                "@DEFAULT_AUDIO_SINK@",
+                "1.0",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        log.info("Default PipeWire audio sink unmuted and set to 100%%")
+
+    except subprocess.CalledProcessError as error:
+        log.warning(
+            "Could not set PipeWire volume; exit code=%s, stderr=%s; "
+            "falling back to ALSA",
+            error.returncode,
+            (error.stderr or "").strip(),
+        )
+
+    except Exception:
+        log.exception(
+            "Unexpected error while setting PipeWire volume; "
+            "falling back to ALSA"
+        )
+
+    try:
+        subprocess.run(
             [
                 "/usr/bin/amixer",
                 "sset",
                 "PCM",
                 "100%",
+                "unmute",
             ],
             capture_output=True,
             text=True,
             check=True,
         )
-
-        log.info("PCM volume set to 100%%")
-
-        if result.stdout.strip():
-            log.debug("amixer output: %s", result.stdout.strip())
+        log.info("ALSA PCM volume unmuted and set to 100%%")
 
     except subprocess.CalledProcessError as error:
         log.error(
-            "Failed to set PCM volume; exit code=%s, stderr=%s",
+            "Failed to set ALSA PCM volume; exit code=%s, stderr=%s",
             error.returncode,
             (error.stderr or "").strip(),
         )
 
     except Exception:
-        log.exception("Unexpected error while setting PCM volume")
+        log.exception("Unexpected error while setting ALSA PCM volume")
 
 
 def ensure_max_volume():
+    set_max_volume()
+
+
+def default_sink_is_bluetooth():
     try:
         result = subprocess.run(
             [
-                "/usr/bin/amixer",
-                "get",
-                "PCM",
+                "/usr/bin/wpctl",
+                "inspect",
+                "@DEFAULT_AUDIO_SINK@",
             ],
             capture_output=True,
             text=True,
             check=True,
         )
 
-        percentages = re.findall(
-            r"\[(\d+)%\]",
-            result.stdout,
-        )
+        is_bluetooth = "bluez" in result.stdout.lower()
 
-        if not percentages:
-            log.warning(
-                "Could not determine PCM volume; attempting to set it to 100%%"
-            )
-            set_max_volume()
-            return
-
-        volumes = [int(value) for value in percentages]
-        log.info("Current PCM volume levels: %s", volumes)
-
-        if any(volume < 100 for volume in volumes):
-            log.warning(
-                "Volume is below maximum; attempting to set it to 100%%"
-            )
-            set_max_volume()
+        if is_bluetooth:
+            log.info("Default PipeWire sink is Bluetooth")
         else:
-            log.info("Volume is already at 100%%")
+            log.info("Default PipeWire sink is not Bluetooth")
 
-    except subprocess.CalledProcessError as error:
-        log.error(
-            "Failed to check PCM volume; exit code=%s, stderr=%s",
-            error.returncode,
-            (error.stderr or "").strip(),
-        )
-        set_max_volume()
+        return is_bluetooth
 
     except Exception:
-        log.exception("Unexpected error while checking PCM volume")
-        set_max_volume()
+        log.exception("Could not inspect the default PipeWire audio sink")
+        return False
 
 
 # ============================================================
@@ -193,23 +218,79 @@ def play_audio():
         ensure_max_volume()
         log.info("Playing audio file: %s", MP3_FILE)
 
-        result = subprocess.run(
-            [
-                "/usr/bin/mpg123",
-                "-q",
-                "-a",
-                AUDIO_DEVICE,
-                MP3_FILE,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
+        output_commands = [
+            (
+                "analog headphones",
+                [
+                    "/usr/bin/mpg123",
+                    "-q",
+                    "-a",
+                    ANALOG_AUDIO_DEVICE,
+                    MP3_FILE,
+                ],
+            )
+        ]
+
+        # When Bluetooth is the PipeWire default, start a second mpg123
+        # process without an ALSA hardware override. Both processes start
+        # back-to-back and play the same file through both outputs.
+        if default_sink_is_bluetooth():
+            output_commands.append(
+                (
+                    "Bluetooth default",
+                    [
+                        "/usr/bin/mpg123",
+                        "-q",
+                        MP3_FILE,
+                    ],
+                )
+            )
+        else:
+            log.warning(
+                "Bluetooth is not the default sink; playing analog output only"
+            )
+
+        processes = []
+
+        for output_name, command in output_commands:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                processes.append((output_name, process))
+                log.info("Started playback on %s", output_name)
+            except Exception:
+                log.exception("Could not start playback on %s", output_name)
+
+        successful_outputs = []
+
+        for output_name, process in processes:
+            stdout, stderr = process.communicate()
+
+            if process.returncode == 0:
+                successful_outputs.append(output_name)
+                log.info("Playback finished on %s", output_name)
+            else:
+                log.error(
+                    "Playback failed on %s; exit code=%s, stderr=%s",
+                    output_name,
+                    process.returncode,
+                    (stderr or "").strip(),
+                )
+
+            if stdout.strip():
+                log.debug("mpg123 %s output: %s", output_name, stdout.strip())
+
+        if not successful_outputs:
+            raise RuntimeError("Playback failed on every configured output")
+
+        log.info(
+            "Playback finished successfully on: %s",
+            ", ".join(successful_outputs),
         )
-
-        if result.stderr.strip():
-            log.warning("mpg123 output: %s", result.stderr.strip())
-
-        log.info("Playback finished successfully")
 
     except FileNotFoundError:
         log.exception(
