@@ -51,6 +51,10 @@ logging.basicConfig(
 
 log = logging.getLogger("door-controller")
 
+# Keep third-party HTTP chatter out of the application log while preserving
+# warnings and errors that are useful for troubleshooting Hubspace failures.
+logging.getLogger("aiohubspace").setLevel(logging.WARNING)
+
 
 # ============================================================
 # RELEASE INFO
