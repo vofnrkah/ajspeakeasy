@@ -2,7 +2,7 @@
 
 from gpiozero import LED, Button
 from signal import pause
-from time import sleep
+from time import monotonic, sleep
 
 import asyncio
 import json
@@ -16,6 +16,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiohubspace import v1
+from mutagen.mp3 import MP3
 
 
 # ============================================================
@@ -61,8 +62,8 @@ logging.getLogger("aiohubspace").setLevel(logging.WARNING)
 # ============================================================
 
 APP_NAME = "AJ Speakeasy Door Controller"
-VERSION = "v0.4.1"
-RELEASE = "26-Second Light Timer Release"
+VERSION = "v0.5.0"
+RELEASE = "Four-Song Rotation Release"
 CREATED_BY = "Y00$ung g00s3"
 
 
@@ -83,8 +84,16 @@ button = None
 # AUDIO CONFIGURATION
 # ============================================================
 
-MP3_FILE = "/home/admin/Desktop/door/jukebox.mp3"
+SONG_FILES = (
+    Path("/home/admin/Desktop/door/jukebox.mp3"),
+    Path("/home/admin/Desktop/door/Chattahoochee.mp3"),
+    Path("/home/admin/Desktop/door/Drive.mp3"),
+    Path("/home/admin/Desktop/door/Good Time.mp3"),
+)
 ANALOG_AUDIO_DEVICE = "hw:Headphones,0"
+LIGHT_READY_TIMEOUT_SECONDS = 15
+PLAYBACK_TIMEOUT_PADDING_SECONDS = 30
+FALLBACK_PLAYBACK_TIMEOUT_SECONDS = 15 * 60
 
 # A system service does not automatically inherit the user's PipeWire runtime
 # path. Setting it here lets mpg123 and wpctl reach admin's default audio sink,
@@ -93,6 +102,7 @@ os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 playing = False
 playback_lock = threading.Lock()
+next_song_index = 0
 
 
 # ============================================================
@@ -100,7 +110,6 @@ playback_lock = threading.Lock()
 # ============================================================
 
 HUBSPACE_CONFIG_FILE = Path.home() / ".config" / "ajspeakeasy" / "hubspace.json"
-LIGHT_ON_SECONDS = 26
 
 
 def load_hubspace_config():
@@ -126,7 +135,13 @@ def load_hubspace_config():
         return None
 
 
-async def hubspace_light_cycle_async(config):
+async def hubspace_light_cycle_async(
+    config,
+    song,
+    song_duration,
+    light_ready_event,
+    playback_finished_event,
+):
     bridge = None
     device_id = config["device_id"]
     instance = config.get("instance")
@@ -150,13 +165,36 @@ async def hubspace_light_cycle_async(config):
 
         await bridge.initialize()
         await bridge.switches.turn_on(device_id, instance=instance)
-        log.info("HUBSPACE LIGHT ON for %s seconds", LIGHT_ON_SECONDS)
-        await asyncio.sleep(LIGHT_ON_SECONDS)
+        log.info("HUBSPACE LIGHT ON for song: %s", song.name)
+        light_ready_event.set()
+
+        # The player process, rather than a fixed timer, decides when the light
+        # turns off. The metadata duration supplies only a safety timeout in
+        # case mpg123 becomes stuck and never reports completion.
+        if song_duration is None:
+            timeout = FALLBACK_PLAYBACK_TIMEOUT_SECONDS
+        else:
+            timeout = song_duration + PLAYBACK_TIMEOUT_PADDING_SECONDS
+
+        playback_completed = await asyncio.to_thread(
+            playback_finished_event.wait,
+            timeout,
+        )
+        if not playback_completed:
+            log.error(
+                "Timed out waiting for playback to finish; song=%s timeout=%.1fs",
+                song.name,
+                timeout,
+            )
 
     except Exception:
         log.exception("Hubspace light cycle failed")
 
     finally:
+        # Never leave audio waiting if Hubspace configuration, authentication,
+        # or the ON command fails.
+        light_ready_event.set()
+
         if bridge is not None:
             try:
                 await bridge.switches.turn_off(device_id, instance=instance)
@@ -170,12 +208,26 @@ async def hubspace_light_cycle_async(config):
                 log.exception("Could not close Hubspace connection")
 
 
-def hubspace_light_cycle():
+def hubspace_light_cycle(
+    song,
+    song_duration,
+    light_ready_event,
+    playback_finished_event,
+):
     config = load_hubspace_config()
     if config is None:
+        light_ready_event.set()
         return
 
-    asyncio.run(hubspace_light_cycle_async(config))
+    asyncio.run(
+        hubspace_light_cycle_async(
+            config,
+            song,
+            song_duration,
+            light_ready_event,
+            playback_finished_event,
+        )
+    )
 
 
 # ============================================================
@@ -323,12 +375,44 @@ def yellow_flash():
 # AUDIO PLAYBACK
 # ============================================================
 
-def play_audio():
+def get_song_duration(song):
+    try:
+        duration = float(MP3(song).info.length)
+        log.info("Song length: %s = %.3f seconds", song.name, duration)
+        return duration
+    except Exception:
+        log.exception("Could not read MP3 duration: %s", song)
+        return None
+
+
+def next_available_song():
+    global next_song_index
+
+    for offset in range(len(SONG_FILES)):
+        index = (next_song_index + offset) % len(SONG_FILES)
+        song = SONG_FILES[index]
+        if song.is_file():
+            next_song_index = (index + 1) % len(SONG_FILES)
+            return index, song
+
+        log.error("Rotation song is missing and will be skipped: %s", song)
+
+    return None, None
+
+
+def play_audio(song, light_ready_event, playback_finished_event):
     global playing
+    playback_started = None
 
     try:
+        if not light_ready_event.wait(LIGHT_READY_TIMEOUT_SECONDS):
+            log.warning(
+                "Light was not ready after %s seconds; starting audio anyway",
+                LIGHT_READY_TIMEOUT_SECONDS,
+            )
+
         ensure_max_volume()
-        log.info("Playing audio file: %s", MP3_FILE)
+        log.info("Playing audio file: %s", song)
 
         # Use exactly one output. When Bluetooth is the PipeWire default,
         # mpg123 follows that default. Otherwise, force the analog ALSA device.
@@ -337,7 +421,7 @@ def play_audio():
             command = [
                 "/usr/bin/mpg123",
                 "-q",
-                MP3_FILE,
+                str(song),
             ]
         else:
             output_name = "analog headphones"
@@ -348,10 +432,11 @@ def play_audio():
                 "alsa",
                 "-a",
                 ANALOG_AUDIO_DEVICE,
-                MP3_FILE,
+                str(song),
             ]
 
         log.info("Starting playback on %s", output_name)
+        playback_started = monotonic()
 
         result = subprocess.run(
             command,
@@ -366,12 +451,18 @@ def play_audio():
         if result.stderr.strip():
             log.warning("mpg123 output: %s", result.stderr.strip())
 
-        log.info("Playback finished successfully on %s", output_name)
+        elapsed = monotonic() - playback_started
+        log.info(
+            "Playback finished successfully; song=%s output=%s elapsed=%.3fs",
+            song.name,
+            output_name,
+            elapsed,
+        )
 
     except FileNotFoundError:
         log.exception(
             "Audio command or MP3 file was not found; file=%s",
-            MP3_FILE,
+            song,
         )
 
     except subprocess.CalledProcessError as error:
@@ -385,6 +476,8 @@ def play_audio():
         log.exception("Unexpected audio playback error")
 
     finally:
+        playback_finished_event.set()
+
         with playback_lock:
             playing = False
 
@@ -413,18 +506,42 @@ def button_pressed():
                 log.warning("BUTTON ACKNOWLEDGED - song is already playing")
                 return
 
+            rotation_index, song = next_available_song()
+            if song is None:
+                log.error("No playable songs were found in the rotation")
+                return
+
             playing = True
 
+        song_duration = get_song_duration(song)
+        log.info(
+            "Selected song %s of %s: %s",
+            rotation_index + 1,
+            len(SONG_FILES),
+            song.name,
+        )
+
+        light_ready_event = threading.Event()
+        playback_finished_event = threading.Event()
+
+        # Start the cloud operation first. Audio waits until the ON command is
+        # confirmed (or fails/times out), so the light covers the whole song.
         threading.Thread(
-            target=play_audio,
-            name="audio-playback",
+            target=hubspace_light_cycle,
+            args=(
+                song,
+                song_duration,
+                light_ready_event,
+                playback_finished_event,
+            ),
+            name="hubspace-light",
             daemon=True,
         ).start()
 
-        # Light control runs independently so cloud latency cannot delay audio.
         threading.Thread(
-            target=hubspace_light_cycle,
-            name="hubspace-light",
+            target=play_audio,
+            args=(song, light_ready_event, playback_finished_event),
+            name="audio-playback",
             daemon=True,
         ).start()
 

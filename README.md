@@ -2,8 +2,8 @@
 
 Raspberry Pi door controller that responds to either a physical GPIO button or
 a software-generated button press. A trigger flashes the yellow status LED,
-plays the jukebox song, and turns a Hubspace-controlled Defiant smart plug on
-for 26 seconds.
+plays the next song in a four-song rotation, and keeps a Hubspace-controlled
+Defiant smart plug on until that song finishes.
 
 The application runs continuously as a `systemd` service and writes structured,
 rotating logs to disk. Physical and software button presses use the same code
@@ -11,23 +11,36 @@ path, so the complete system can be tested without the button connected.
 
 ## Current release
 
-- Version: `v0.4.1`
-- Release: `26-Second Light Timer Release`
+- Version: `v0.5.0`
+- Release: `Four-Song Rotation Release`
 - Tested smart plug: Defiant HPPA11CWB
 - Tested Raspberry Pi: Raspberry Pi 3 Model B+
 - Tested Python: Python 3.13
 
 ## Trigger behavior
 
-Each accepted button press performs these operations concurrently:
+Each accepted button press performs these operations:
 
 1. Flash the yellow LED for 0.25 seconds.
-2. Play `/home/admin/Desktop/door/jukebox.mp3`.
-3. Authenticate to Hubspace using the saved refresh token.
-4. Turn on the configured smart plug.
-5. Wait 26 seconds.
-6. Attempt to turn off the smart plug, including when another Hubspace error
+2. Select the next available MP3 in the rotation.
+3. Read and log the MP3's metadata duration.
+4. Authenticate to Hubspace using the saved refresh token.
+5. Turn on the configured smart plug.
+6. Start the selected song after the ON command is confirmed. If Hubspace
+   fails or does not respond within 15 seconds, audio proceeds without it.
+7. Wait for the actual `mpg123` playback process to finish.
+8. Attempt to turn off the smart plug, including when another Hubspace error
    occurs during the light cycle.
+
+The rotation order is:
+
+1. `jukebox.mp3`
+2. `Chattahoochee.mp3`
+3. `Drive.mp3`
+4. `Good Time.mp3`
+
+The next press returns to `jukebox.mp3`. The rotation begins at the first song
+again whenever the service restarts. Missing files are logged and skipped.
 
 While a song is already playing, additional button presses are acknowledged in
 the log but do not start overlapping audio or another light cycle.
@@ -98,10 +111,27 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Copy the MP3 file to the configured location:
+Copy all four MP3 files to the configured locations:
 
 ```text
 /home/admin/Desktop/door/jukebox.mp3
+/home/admin/Desktop/door/Chattahoochee.mp3
+/home/admin/Desktop/door/Drive.mp3
+/home/admin/Desktop/door/Good Time.mp3
+```
+
+From a Mac terminal, the three additional files can be copied in one command:
+
+```bash
+scp "$HOME/Desktop/Chattahoochee.mp3" "$HOME/Desktop/Drive.mp3" \
+  "$HOME/Desktop/Good Time.mp3" \
+  admin@ajspeakeasypi.local:/home/admin/Desktop/door/
+```
+
+Run this on the Pi afterward to confirm the names and sizes:
+
+```bash
+ls -lh ~/Desktop/door/*.mp3
 ```
 
 Install and enable the service:
@@ -190,8 +220,8 @@ sudo systemctl kill --kill-whom=main --signal=SIGUSR1 door-controller
 ```
 
 This executes the same `button_pressed()` function used by the GPIO button. It
-should flash the yellow LED, start one audio stream, turn the configured plug
-on, and turn it off after 26 seconds.
+should flash the yellow LED, select the next song, turn the configured plug on,
+play one audio stream, and turn the plug off when playback ends.
 
 Follow the log during the test:
 
@@ -204,10 +234,12 @@ Successful events include:
 ```text
 TEST BUTTON SIGNAL RECEIVED
 BUTTON PRESSED
+Selected song 1 of 4: jukebox.mp3
+Song length: jukebox.mp3 = 27.500 seconds
+HUBSPACE LIGHT ON for song: jukebox.mp3
 Starting playback on Bluetooth default
-HUBSPACE LIGHT ON for 26 seconds
+Playback finished successfully; song=jukebox.mp3 output=Bluetooth default elapsed=27.500s
 HUBSPACE LIGHT OFF
-Playback finished successfully on Bluetooth default
 Ready for next button press
 ```
 
@@ -337,7 +369,7 @@ sudo systemctl restart door-controller
 ### Song does not play
 
 ```bash
-ls -lh /home/admin/Desktop/door/jukebox.mp3
+ls -lh /home/admin/Desktop/door/*.mp3
 command -v mpg123
 wpctl status
 wpctl inspect @DEFAULT_AUDIO_SINK@
